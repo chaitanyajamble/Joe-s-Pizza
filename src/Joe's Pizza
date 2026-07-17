@@ -1,0 +1,667 @@
+
+
+import os
+import uuid
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import (
+    Boolean, Column, DateTime, Float, ForeignKey,
+    Integer, String, Text, create_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
+
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sql:///./joes_pizza.db")
+SECRET_KEY = os.getenv("SECRET_KEY", "joes-pizza-super-secret-1975")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+app = FastAPI(
+    title="Joe's Pizza NYC API",
+    description="Backend for joespizzanyc.com – established 1975, Greenwich Village",
+    version="1.0.0",
+)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Location(Base):
+    __tablename__ = "locations"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, default="Joe's Pizza")
+    address = Column(String, nullable=False)
+    city = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    zip_code = Column(String, nullable=False)
+    phone = Column(String)
+    order_url = Column(String)
+    orders = relationship("Order", back_populates="location")
+    reviews = relationship("Review", back_populates="location")
+
+
+class Category(Base):
+    __tablename__ = "categories"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False) # e.g. "Pizza", "Drinks"
+    description = Column(Text)
+    items = relationship("MenuItem", back_populates="category")
+
+
+class MenuItem(Base):
+    __tablename__ = "menu_items"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text)
+    price = Column(Float, nullable=False)
+    category_id = Column(Integer, ForeignKey("categories.id"))
+    is_available = Column(Boolean, default=True)
+    image_url = Column(String)
+    category = relationship("Category", back_populates="items")
+    cart_items = relationship("CartItem", back_populates="menu_item")
+    order_items = relationship("OrderItem", back_populates="menu_item")
+
+
+class Customer(Base):
+    __tablename__ = "customers"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    phone = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    carts = relationship("Cart", back_populates="customer")
+    orders = relationship("Order", back_populates="customer")
+    reviews = relationship("Review", back_populates="customer")
+
+
+class Cart(Base):
+    __tablename__ = "carts"
+    id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"))
+    location_id = Column(Integer, ForeignKey("locations.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    customer = relationship("Customer", back_populates="carts")
+    items = relationship("CartItem", back_populates="cart", cascade="all, delete-orphan")
+
+
+class CartItem(Base):
+    __tablename__ = "cart_items"
+    id = Column(Integer, primary_key=True, index=True)
+    cart_id = Column(Integer, ForeignKey("carts.id"))
+    menu_item_id = Column(Integer, ForeignKey("menu_items.id"))
+    quantity = Column(Integer, default=1)
+    special_instructions = Column(Text)
+    cart = relationship("Cart", back_populates="items")
+    menu_item = relationship("MenuItem", back_populates="cart_items")
+
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    customer_id = Column(Integer, ForeignKey("customers.id"))
+    location_id = Column(Integer, ForeignKey("locations.id"))
+    status = Column(String, default="pending") # pending | confirmed | preparing | ready | delivered
+    total = Column(Float)
+    order_type = Column(String, default="pickup") # pickup | delivery
+    delivery_address = Column(Text)
+    placed_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    customer = relationship("Customer", back_populates="orders")
+    location = relationship("Location", back_populates="orders")
+    items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
+
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(String, ForeignKey("orders.id"))
+    menu_item_id = Column(Integer, ForeignKey("menu_items.id"))
+    quantity = Column(Integer, default=1)
+    unit_price = Column(Float)
+    special_instructions = Column(Text)
+    order = relationship("Order", back_populates="items")
+    menu_item = relationship("MenuItem", back_populates="order_items")
+
+
+class Review(Base):
+    __tablename__ = "reviews"
+    id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"))
+    location_id = Column(Integer, ForeignKey("locations.id"))
+    rating = Column(Integer) # 1–5
+    comment = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    customer = relationship("Customer", back_populates="reviews")
+    location = relationship("Location", back_populates="reviews")
+
+
+Base.metadata.create_all(bind=engine)
+
+
+# --- Auth ---
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class CustomerCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    phone: Optional[str] = None
+
+
+class CustomerOut(BaseModel):
+    id: int
+    name: str
+    email: str
+    phone: Optional[str]
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
+# --- Location ---
+class LocationOut(BaseModel):
+    id: int
+    name: str
+    address: str
+    city: str
+    state: str
+    zip_code: str
+    phone: Optional[str]
+    order_url: Optional[str]
+    class Config:
+        from_attributes = True
+
+
+# --- Menu ---
+class MenuItemOut(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    price: float
+    is_available: bool
+    image_url: Optional[str]
+    class Config:
+        from_attributes = True
+
+
+class CategoryOut(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    items: List[MenuItemOut] = []
+    class Config:
+        from_attributes = True
+
+
+# --- Cart ---
+class CartItemCreate(BaseModel):
+    menu_item_id: int
+    quantity: int = Field(ge=1, default=1)
+    special_instructions: Optional[str] = None
+
+
+class CartItemOut(BaseModel):
+    id: int
+    menu_item: MenuItemOut
+    quantity: int
+    special_instructions: Optional[str]
+    class Config:
+        from_attributes = True
+
+
+class CartOut(BaseModel):
+    id: int
+    location_id: Optional[int]
+    items: List[CartItemOut] = []
+    subtotal: float = 0.0
+    class Config:
+        from_attributes = True
+
+
+# --- Order ---
+class OrderCreate(BaseModel):
+    cart_id: int
+    order_type: str = "pickup"
+    delivery_address: Optional[str] = None
+
+
+class OrderOut(BaseModel):
+    id: str
+    status: str
+    total: float
+    order_type: str
+    placed_at: datetime
+    items: List[CartItemOut] = []
+    class Config:
+        from_attributes = True
+
+
+# --- Review ---
+class ReviewCreate(BaseModel):
+    location_id: int
+    rating: int = Field(ge=1, le=5)
+    comment: Optional[str] = None
+
+
+class ReviewOut(BaseModel):
+    id: int
+    rating: int
+    comment: Optional[str]
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode["exp"] = expire
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_customer(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Customer:
+    cred_exc = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if not email:
+            raise cred_exc
+    except JWTError:
+        raise cred_exc
+    customer = db.query(Customer).filter(Customer.email == email).first()
+    if not customer:
+        raise cred_exc
+    return customer
+
+
+def cart_subtotal(cart: Cart) -> float:
+    return round(sum(ci.menu_item.price * ci.quantity for ci in cart.items), 2)
+
+
+
+def seed_db():
+    db = SessionLocal()
+    if db.query(Location).count() > 0:
+        db.close()
+        return # already seeded
+
+    # Locations (from joespizzanyc.com/locations)
+    locations_data = [
+        ("7 Carmine Street", "New York", "NY", "10014", "(212) 366-1182"),
+        ("150 East 14th Street", "New York", "NY", "10003", "(212) 388-9474"),
+        ("1435 Broadway", "New York", "NY", "10018", "(646) 559-4878"),
+        ("124 Fulton Street", "New York", "NY", "10038", "(212) 267-0860"),
+        ("216 Bedford Avenue", "Brooklyn", "NY", "11249", "(718) 388-2216"),
+        ("1365 Boylston Street", "Boston", "MA", "02215", "(617) 936-4464"),
+        ("3 Brattle Street", "Cambridge", "MA", "02138", "(857) 226-4942"),
+        ("234 NW 25th Street", "Miami", "FL", "33127", "(786) 230-1441"),
+        ("1674 Meridian Ave", "Miami Beach","FL", "33139", "(305) 851-6773"),
+        ("1107 S University Ave", "Ann Arbor", "MI", "48104", "(734) 213-5625"),
+    ]
+    for address, city, state, zip_code, phone in locations_data:
+        db.add(Location(address=address, city=city, state=state, zip_code=zip_code, phone=phone))
+
+    # Categories & Menu items
+    categories = {
+        "Pizza by the Slice": [
+            ("Plain Slice", "Classic NY street slice – thin crust, tomato, mozzarella", 3.50),
+            ("Pepperoni Slice", "Plain slice topped with pepperoni", 4.00),
+            ("Sicilian Slice", "Thick square slice, extra sauce", 4.50),
+            ("Fresh Mozzarella Slice", "Sliced fresh mozzarella, basil, olive oil", 5.00),
+        ],
+        "Whole Pies": [
+            ("Plain Pie (18\")", "Whole classic cheese pizza", 22.00),
+            ("Pepperoni Pie (18\")", "Whole pie with pepperoni", 26.00),
+            ("Margherita Pie (18\")", "San Marzano tomato, fresh mozz, basil", 28.00),
+            ("Veggie Pie (18\")", "Bell peppers, mushrooms, onions, olives", 27.00),
+        ],
+        "Drinks": [
+            ("Canned Soda (12oz)", "Coke, Diet Coke, Sprite, or Water", 2.00),
+            ("Bottled Water", "16.9 oz", 1.50),
+        ],
+        "Extras": [
+            ("Extra Cheese", "Add extra mozzarella to any item", 1.50),
+            ("Extra Toppings", "Pepperoni, mushrooms, peppers, onions", 1.00),
+        ],
+    }
+    for cat_name, items in categories.items():
+        cat = Category(name=cat_name)
+        db.add(cat)
+        db.flush()
+        for item_name, desc, price in items:
+            db.add(MenuItem(name=item_name, description=desc, price=price, category_id=cat.id))
+
+    db.commit()
+    db.close()
+
+
+seed_db()
+
+
+@app.post("/auth/register", response_model=CustomerOut, tags=["Auth"])
+def register(data: CustomerCreate, db: Session = Depends(get_db)):
+    """Register a new customer account."""
+    if db.query(Customer).filter(Customer.email == data.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    customer = Customer(
+        name=data.name,
+        email=data.email,
+        hashed_password=hash_password(data.password),
+        phone=data.phone,
+    )
+    db.add(customer)
+    db.commit()
+    db.refresh(customer)
+    return customer
+
+
+@app.post("/auth/token", response_model=Token, tags=["Auth"])
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """Login and receive a JWT bearer token."""
+    customer = db.query(Customer).filter(Customer.email == form.username).first()
+    if not customer or not verify_password(form.password, customer.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    token = create_access_token({"sub": customer.email})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/auth/me", response_model=CustomerOut, tags=["Auth"])
+def me(current: Customer = Depends(get_current_customer)):
+    """Return the logged-in customer's profile."""
+    return current
+
+
+@app.get("/locations", response_model=List[LocationOut], tags=["Locations"])
+def list_locations(db: Session = Depends(get_db)):
+    """Return all Joe's Pizza locations (mirrors joespizzanyc.com/locations)."""
+    return db.query(Location).all()
+
+
+@app.get("/locations/{location_id}", response_model=LocationOut, tags=["Locations"])
+def get_location(location_id: int, db: Session = Depends(get_db)):
+    loc = db.query(Location).filter(Location.id == location_id).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Location not found")
+    return loc
+
+
+
+@app.get("/menu", response_model=List[CategoryOut], tags=["Menu"])
+def full_menu(db: Session = Depends(get_db)):
+    """Return the full menu grouped by category."""
+    return db.query(Category).all()
+
+
+@app.get("/menu/items", response_model=List[MenuItemOut], tags=["Menu"])
+def list_items(category_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """List menu items, optionally filtered by category."""
+    q = db.query(MenuItem).filter(MenuItem.is_available == True)
+    if category_id:
+        q = q.filter(MenuItem.category_id == category_id)
+    return q.all()
+
+
+@app.get("/menu/items/{item_id}", response_model=MenuItemOut, tags=["Menu"])
+def get_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(MenuItem).filter(MenuItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+    return item
+
+
+
+@app.post("/cart", response_model=CartOut, tags=["Cart"])
+def create_cart(
+    location_id: Optional[int] = None,
+    current: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    """Create a new cart for the logged-in customer."""
+    cart = Cart(customer_id=current.id, location_id=location_id)
+    db.add(cart)
+    db.commit()
+    db.refresh(cart)
+    return {**cart.__dict__, "subtotal": 0.0}
+
+
+@app.get("/cart/{cart_id}", response_model=CartOut, tags=["Cart"])
+def view_cart(
+    cart_id: int,
+    current: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    cart = db.query(Cart).filter(Cart.id == cart_id, Cart.customer_id == current.id).first()
+    if not cart:
+        raise HTTPException(status_code=404, detail="Cart not found")
+    return {**cart.__dict__, "subtotal": cart_subtotal(cart)}
+
+
+@app.post("/cart/{cart_id}/items", response_model=CartOut, tags=["Cart"])
+def add_to_cart(
+    cart_id: int,
+    item: CartItemCreate,
+    current: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    """Add a menu item to the cart."""
+    cart = db.query(Cart).filter(Cart.id == cart_id, Cart.customer_id == current.id).first()
+    if not cart:
+        raise HTTPException(status_code=404, detail="Cart not found")
+    menu_item = db.query(MenuItem).filter(MenuItem.id == item.menu_item_id, MenuItem.is_available == True).first()
+    if not menu_item:
+        raise HTTPException(status_code=404, detail="Menu item not found or unavailable")
+
+    # Merge if same item already in cart
+    existing = next((ci for ci in cart.items if ci.menu_item_id == item.menu_item_id), None)
+    if existing:
+        existing.quantity += item.quantity
+    else:
+        db.add(CartItem(
+            cart_id=cart.id,
+            menu_item_id=item.menu_item_id,
+            quantity=item.quantity,
+            special_instructions=item.special_instructions,
+        ))
+    db.commit()
+    db.refresh(cart)
+    return {**cart.__dict__, "subtotal": cart_subtotal(cart)}
+
+
+@app.delete("/cart/{cart_id}/items/{cart_item_id}", response_model=CartOut, tags=["Cart"])
+def remove_from_cart(
+    cart_id: int,
+    cart_item_id: int,
+    current: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    cart = db.query(Cart).filter(Cart.id == cart_id, Cart.customer_id == current.id).first()
+    if not cart:
+        raise HTTPException(status_code=404, detail="Cart not found")
+    ci = db.query(CartItem).filter(CartItem.id == cart_item_id, CartItem.cart_id == cart_id).first()
+    if not ci:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+    db.delete(ci)
+    db.commit()
+    db.refresh(cart)
+    return {**cart.__dict__, "subtotal": cart_subtotal(cart)}
+
+
+
+@app.post("/orders", response_model=OrderOut, tags=["Orders"])
+def place_order(
+    data: OrderCreate,
+    current: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    """Convert a cart into a confirmed order."""
+    cart = db.query(Cart).filter(Cart.id == data.cart_id, Cart.customer_id == current.id).first()
+    if not cart or not cart.items:
+        raise HTTPException(status_code=400, detail="Cart is empty or not found")
+    if data.order_type == "delivery" and not data.delivery_address:
+        raise HTTPException(status_code=400, detail="Delivery address required")
+
+    total = cart_subtotal(cart)
+    order = Order(
+        customer_id=current.id,
+        location_id=cart.location_id,
+        status="confirmed",
+        total=total,
+        order_type=data.order_type,
+        delivery_address=data.delivery_address,
+    )
+    db.add(order)
+    db.flush()
+
+    for ci in cart.items:
+        db.add(OrderItem(
+            order_id=order.id,
+            menu_item_id=ci.menu_item_id,
+            quantity=ci.quantity,
+            unit_price=ci.menu_item.price,
+            special_instructions=ci.special_instructions,
+        ))
+
+    # Clear cart after order
+    for ci in cart.items:
+        db.delete(ci)
+    db.delete(cart)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.get("/orders", response_model=List[OrderOut], tags=["Orders"])
+def order_history(current: Customer = Depends(get_current_customer), db: Session = Depends(get_db)):
+    """Return all past orders for the logged-in customer."""
+    return db.query(Order).filter(Order.customer_id == current.id).order_by(Order.placed_at.desc()).all()
+
+
+@app.get("/orders/{order_id}", response_model=OrderOut, tags=["Orders"])
+def track_order(
+    order_id: str,
+    current: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    """Track a specific order by ID."""
+    order = db.query(Order).filter(Order.id == order_id, Order.customer_id == current.id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+
+@app.patch("/orders/{order_id}/status", tags=["Orders"])
+def update_order_status(
+    order_id: str,
+    new_status: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Admin endpoint: update order status.
+    Valid values: pending | confirmed | preparing | ready | delivered
+    """
+    valid = {"pending", "confirmed", "preparing", "ready", "delivered", "cancelled"}
+    if new_status not in valid:
+        raise HTTPException(status_code=400, detail=f"Status must be one of {valid}")
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    order.status = new_status
+    db.commit()
+    return {"order_id": order_id, "status": new_status}
+
+
+@app.post("/reviews", response_model=ReviewOut, tags=["Reviews"])
+def post_review(
+    data: ReviewCreate,
+    current: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    """Submit a review for a Joe's Pizza location."""
+    loc = db.query(Location).filter(Location.id == data.location_id).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Location not found")
+    review = Review(
+        customer_id=current.id,
+        location_id=data.location_id,
+        rating=data.rating,
+        comment=data.comment,
+    )
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+
+@app.get("/reviews/location/{location_id}", response_model=List[ReviewOut], tags=["Reviews"])
+def get_reviews(location_id: int, db: Session = Depends(get_db)):
+    """Get all reviews for a specific location."""
+    return db.query(Review).filter(Review.location_id == location_id).order_by(Review.created_at.desc()).all()
+
+
+@app.get("/reviews/location/{location_id}/summary", tags=["Reviews"])
+def review_summary(location_id: int, db: Session = Depends(get_db)):
+    """Return average rating and count for a location."""
+    reviews = db.query(Review).filter(Review.location_id == location_id).all()
+    if not reviews:
+        return {"location_id": location_id, "average_rating": None, "total_reviews": 0}
+    avg = round(sum(r.rating for r in reviews) / len(reviews), 2)
+    return {"location_id": location_id, "average_rating": avg, "total_reviews": len(reviews)}
+
+
+@app.get("/social/instagram", tags=["Social"])
+def instagram_link():
+    """
+    Returns the official Joe's Pizza NYC Instagram profile link.
+    Extend this with the Instagram Graph API for live posts.
+    """
+    return {
+        "platform": "Instagram",
+        "handle": "@joespizzanyc",
+        "url": "https://www.instagram.com/joespizzanyc/",
+        "note": "Follow us for daily slice specials and NYC pizza culture.",
+    }
+
+
+
+@app.get("/health", tags=["System"])
+def health():
+    return {"status": "ok", "service": "Joe's Pizza NYC API", "since": 1975}
+
+
+# Entry Point
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("joes_pizza_backend:app", host="0.0.0.0", port=8000, reload=True)
